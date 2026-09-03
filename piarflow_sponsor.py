@@ -11,8 +11,6 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 
-# ============ КОНФИГУРАЦИЯ ============
-
 SERVICE_CONFIG = {
     "piarflow": {
         "base_url": "https://piarflow.com/api/v1",
@@ -32,10 +30,14 @@ async def http_json(method: str, url: str, params: dict = None, json_body: dict 
         async with aiohttp.ClientSession() as session:
             if method == "GET":
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    return await resp.json()
+                    result = await resp.json()
+                    print(f"PiarFlow GET response: {result}")
+                    return result
             elif method == "POST":
                 async with session.post(url, json=json_body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    return await resp.json()
+                    result = await resp.json()
+                    print(f"PiarFlow POST response: {result}")
+                    return result
     except Exception as e:
         print(f"HTTP error: {e}")
         return {}
@@ -82,6 +84,12 @@ async def init_sponsor_db():
                 PRIMARY KEY (user_id, service, offer_id, link)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_sponsor_shown (
+                user_id INTEGER PRIMARY KEY,
+                last_shown REAL NOT NULL
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sponsor_cache_expires ON sponsor_cache(expires_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sponsor_tasks_user ON sponsor_tasks(user_id)")
         await db.commit()
@@ -100,11 +108,13 @@ def utc_now() -> str:
 
 def normalize_offers(service: str, payload: Any) -> tuple[list[dict], str | None]:
     tasks = []
-    for i, item in enumerate(payload.get("sponsors") or []):
+    sponsors_data = payload.get("sponsors") or payload.get("channels") or []
+    
+    for i, item in enumerate(sponsors_data):
         if not isinstance(item, dict):
             continue
         
-        link = item.get("link") or item.get("url") or item.get("invite_link")
+        link = item.get("link") or item.get("url") or item.get("invite_link") or item.get("channel_link")
         if not link:
             continue
         
@@ -122,6 +132,8 @@ def normalize_offers(service: str, payload: Any) -> tuple[list[dict], str | None
 
 async def fetch_sponsors_from_service(service: str, user: Any) -> list[dict]:
     api_key = os.getenv(SERVICE_CONFIG[service]["key_env"], "").strip()
+    print(f"API Key present: {bool(api_key)}")
+    
     if not api_key:
         return []
     
@@ -146,7 +158,7 @@ async def check_subscriptions_on_service(service: str, user: Any, tasks: list[di
             f"{SERVICE_CONFIG['piarflow']['base_url']}/check",
             json_body={"api_key": api_key, "telegram_id": user.id}
         )
-        items = payload.get("sponsors") or []
+        items = payload.get("sponsors") or payload.get("channels") or []
         return all(
             status_name(i.get("status"), i.get("subscribed")) == "subscribed"
             for i in items if isinstance(i, dict)
@@ -168,35 +180,61 @@ async def cached_sponsors(user: Any, force_refresh: bool = False) -> list[dict]:
             tasks.extend(json.loads(cached["payload"]))
         else:
             new_tasks = await fetch_sponsors_from_service(service, user)
-            await db_execute(
-                "INSERT OR REPLACE INTO sponsor_cache(cache_key, payload, expires_at) VALUES (?,?,?)",
-                (cache_key, json.dumps(new_tasks), time.time() + SPONSOR_CACHE_SECONDS)
-            )
-            tasks.extend(new_tasks)
+            if new_tasks:
+                await db_execute(
+                    "INSERT OR REPLACE INTO sponsor_cache(cache_key, payload, expires_at) VALUES (?,?,?)",
+                    (cache_key, json.dumps(new_tasks), time.time() + SPONSOR_CACHE_SECONDS)
+                )
+                tasks.extend(new_tasks)
     
-    await db_execute("DELETE FROM sponsor_tasks WHERE user_id = ?", (user.id,))
-    for t in tasks:
-        await db_execute(
-            "INSERT OR REPLACE INTO sponsor_tasks(user_id, service, offer_id, link, status, created_at) VALUES (?,?,?,?,?,?)",
-            (user.id, t["service"], t["id"], t["link"], t["status"], utc_now())
-        )
+    if tasks:
+        await db_execute("DELETE FROM sponsor_tasks WHERE user_id = ?", (user.id,))
+        for t in tasks:
+            await db_execute(
+                "INSERT OR REPLACE INTO sponsor_tasks(user_id, service, offer_id, link, status, created_at) VALUES (?,?,?,?,?,?)",
+                (user.id, t["service"], t["id"], t["link"], t["status"], utc_now())
+            )
     
     return tasks
 
-# ============ ОБРАБОТЧИКИ ============
+async def should_show_sponsors(user_id: int) -> bool:
+    """Проверяем нужно ли показать спонсоров (каждые 5 минут)"""
+    last_shown = await db_fetchone(
+        "SELECT last_shown FROM user_sponsor_shown WHERE user_id = ?",
+        (user_id,)
+    )
+    
+    if not last_shown:
+        return True
+    
+    return time.time() - float(last_shown["last_shown"]) >= 300  # 5 минут
 
-@sponsor_router.message(Command("sponsors"))
-async def cmd_sponsors(message: Message):
+async def mark_sponsors_shown(user_id: int):
+    """Отмечаем что показали спонсоров"""
+    await db_execute(
+        "INSERT OR REPLACE INTO user_sponsor_shown(user_id, last_shown) VALUES (?,?)",
+        (user_id, time.time())
+    )
+
+async def show_sponsors_to_user(message: Message):
+    """Показать спонсоров пользователю"""
     user = message.from_user
     
     sponsors = await cached_sponsors(user, force_refresh=True)
     
     if not sponsors:
-        await message.answer("📭 Нет активных спонсоров для проверки.")
-        return
+        print(f"Нет спонсоров для пользователя {user.id}")
+        return False
     
-    text = "📢 <b>Спонсоры PiarFlow</b>\n\n"
-    text += "Подпишитесь на каналы ниже и нажмите кнопку проверки:\n\n"
+    # Проверяем подписки
+    all_subscribed = await check_subscriptions_on_service("piarflow", user, sponsors)
+    
+    if all_subscribed:
+        print(f"Пользователь {user.id} уже подписан на всех спонсоров")
+        return False
+    
+    text = "📢 <b>Подпишитесь на спонсоров</b>\n\n"
+    text += "Для продолжения работы с ботом подпишитесь на каналы:\n\n"
     
     keyboard = []
     for idx, sponsor in enumerate(sponsors, 1):
@@ -220,6 +258,14 @@ async def cmd_sponsors(message: Message):
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
     
     await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    await mark_sponsors_shown(user.id)
+    return True
+
+# ============ ОБРАБОТЧИКИ ============
+
+@sponsor_router.message(Command("sponsors"))
+async def cmd_sponsors(message: Message):
+    await show_sponsors_to_user(message)
 
 @sponsor_router.callback_query(F.data == "check_piarflow_subscription")
 async def callback_check_subscription(callback: CallbackQuery):
@@ -227,7 +273,7 @@ async def callback_check_subscription(callback: CallbackQuery):
     
     user = callback.from_user
     
-    sponsors = await cached_sponsors(user, force_refresh=False)
+    sponsors = await cached_sponsors(user, force_refresh=True)
     
     if not sponsors:
         await callback.message.answer("❌ Не найдено спонсоров для проверки.")
@@ -242,8 +288,6 @@ async def callback_check_subscription(callback: CallbackQuery):
             parse_mode="HTML"
         )
     else:
-        sponsors = await cached_sponsors(user, force_refresh=True)
-        
         text = "⚠️ <b>Не все подписки активны</b>\n\n"
         text += "Пожалуйста, подпишитесь на все каналы:\n\n"
         
@@ -270,3 +314,32 @@ async def callback_check_subscription(callback: CallbackQuery):
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
         
         await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+# ============ MIDDLEWARE ============
+
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from typing import Callable, Dict, Any, Awaitable
+
+class SponsorMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        
+        # Пропускаем callback от проверки спонсоров
+        if hasattr(event, 'data') and event.data == "check_piarflow_subscription":
+            return await handler(event, data)
+        
+        if user and hasattr(event, 'text'):
+            # Проверяем нужно ли показать спонсоров
+            if await should_show_sponsors(user.id):
+                shown = await show_sponsors_to_user(event)
+                if shown:
+                    # Блокируем дальнейшее выполнение
+                    return
+        
+        return await handler(event, data)
